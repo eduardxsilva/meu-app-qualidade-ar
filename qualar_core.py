@@ -715,8 +715,18 @@ def export_excel(tables: Dict[str, pd.DataFrame], output_path: Path, text_report
                         break
             if ws_df is not None:
                 for idx, col in enumerate(ws_df.columns):
-                    sample = ws_df[col].astype(str).replace("nan", "").head(1000)
-                    max_len = max([len(str(col))] + sample.map(len).tolist())
+                    # Pandas/Streamlit Cloud pode usar dtype Arrow.
+                    # Nessa condição, Series.map(len) quebra quando há <NA>,
+                    # Timestamp, numpy scalars ou valores não-string.
+                    # A conversão abaixo é deliberadamente defensiva.
+                    sample_values = ws_df[col].head(1000).tolist()
+                    sample_lengths = []
+                    for value in sample_values:
+                        if pd.isna(value):
+                            sample_lengths.append(0)
+                        else:
+                            sample_lengths.append(len(str(value)))
+                    max_len = max([len(str(col))] + sample_lengths)
                     width = min(max(max_len + 2, 10), 38)
                     worksheet.set_column(idx, idx, width)
                     if pd.api.types.is_numeric_dtype(ws_df[col]):

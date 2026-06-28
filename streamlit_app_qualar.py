@@ -107,7 +107,7 @@ def classificar_coluna_qualar(coluna: str) -> str:
     # Evita confundir Data/Hora com parâmetros
     if n in {"data", "date"}:
         return "Data"
-    if n in {"hora", "hour", "time"}:
+    if n in {"hora", "hour", "time"} or n.startswith("hora ") or "hora utc" in n:
         return "Hora"
 
     # Poluentes principais do trabalho
@@ -128,21 +128,47 @@ def classificar_coluna_qualar(coluna: str) -> str:
     if re.search(r"\bco\b", n) or "monoxido de carbono" in n:
         return "CO (ppm)"
 
-    # Meteorologia
-    if n.startswith("temp") or "temperatura" in n:
-        return "Temperatura (°C)"
-    if n in {"ur", "ur - %"} or "umidade relativa" in n:
-        return "Umidade relativa (%)"
-    if n.startswith("vv") or "velocidade do vento" in n:
-        return "Velocidade do vento (m/s)"
-    if n.startswith("dv") or "direcao do vento" in n or "direção do vento" in n:
-        return "Direção do vento (°)"
+    # Meteorologia — QUALAR, INMET e nomes equivalentes
     if "precipitacao" in n or "precipitação" in n or n.startswith("prec") or "chuva" in n:
         return "Precipitação (mm)"
+
     if "pressao" in n or "pressão" in n:
+        if "max" in n:
+            return "Pressão máxima horária (hPa)"
+        if "min" in n:
+            return "Pressão mínima horária (hPa)"
         return "Pressão atmosférica (hPa)"
+
     if "radiacao" in n or "radiação" in n:
-        return "Radiação solar"
+        return "Radiação solar (kJ/m²)"
+
+    if "ponto de orvalho" in n or "orvalho" in n:
+        if "max" in n:
+            return "Ponto de orvalho máximo horário (°C)"
+        if "min" in n:
+            return "Ponto de orvalho mínimo horário (°C)"
+        return "Ponto de orvalho (°C)"
+
+    if n.startswith("temp") or "temperatura" in n:
+        if "max" in n:
+            return "Temperatura máxima horária (°C)"
+        if "min" in n:
+            return "Temperatura mínima horária (°C)"
+        return "Temperatura (°C)"
+
+    if n in {"ur", "ur - %"} or "umidade relativa" in n or n.startswith("umidade rel"):
+        if "max" in n:
+            return "Umidade relativa máxima horária (%)"
+        if "min" in n:
+            return "Umidade relativa mínima horária (%)"
+        return "Umidade relativa (%)"
+
+    if "rajada" in n:
+        return "Rajada máxima do vento (m/s)"
+    if n.startswith("vv") or "velocidade do vento" in n or ("vento" in n and "velocidade" in n):
+        return "Velocidade do vento (m/s)"
+    if n.startswith("dv") or "direcao do vento" in n or "direção do vento" in n or ("vento" in n and ("direcao" in n or "direção" in n)):
+        return "Direção do vento (°)"
 
     return bruto
 
@@ -201,7 +227,12 @@ def linha_parece_data(linha: str) -> bool:
     if not partes:
         return False
     primeiro = partes[0].strip()
-    return bool(re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", primeiro))
+    # QUALAR costuma vir como dd/mm/aaaa; INMET costuma vir como aaaa/mm/dd.
+    return bool(
+        re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", primeiro)
+        or re.match(r"^\d{4}/\d{1,2}/\d{1,2}$", primeiro)
+        or re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", primeiro)
+    )
 
 
 def extrair_metadados_qualar(linhas: list[str]) -> dict[str, str]:
@@ -214,21 +245,36 @@ def extrair_metadados_qualar(linhas: list[str]) -> dict[str, str]:
         valor = partes[1].strip()
         if not valor:
             continue
-        if "nome da estacao" in chave:
+        if "nome da estacao" in chave or chave == "estacao":
             meta["estacao"] = valor
-        elif "codigo da estacao" in chave or "cod estacao" in chave:
+        elif "codigo da estacao" in chave or "cod estacao" in chave or "codigo (wmo)" in chave:
             meta["codigo_estacao"] = valor
+        elif chave == "latitude":
+            meta["latitude"] = valor
+        elif chave == "longitude":
+            meta["longitude"] = valor
         elif "tipo de monitoramento" in chave:
             meta["tipo_monitoramento"] = valor
     return meta
 
 
 def identificar_linha_dados(linhas: list[str]) -> tuple[int, int]:
-    """Retorna (indice_linha_parametros, indice_primeira_linha_dados)."""
+    """Retorna (indice_linha_parametros, indice_primeira_linha_dados).
+
+    Aceita dois formatos comuns:
+    - QUALAR/CETESB: cabeçalho de parâmetros antes da primeira data em dd/mm/aaaa.
+    - INMET: linha "Data;Hora UTC;..." antes da primeira data em aaaa/mm/dd.
+    """
+    for i, linha in enumerate(linhas):
+        partes_norm = [normalizar_texto(p).replace(":", "") for p in linha.split(";")[:3]]
+        if len(partes_norm) >= 2 and partes_norm[0] == "data" and partes_norm[1].startswith("hora"):
+            return i, i + 1
+
     for i, linha in enumerate(linhas):
         if linha_parece_data(linha):
             return max(i - 1, 0), i
-    # fallback do QUALAR usado no script original
+
+    # fallback conservador para QUALAR antigo
     if len(linhas) > 8:
         return 7, 8
     raise ValueError("Não foi possível localizar a primeira linha de dados com Data/Hora.")
@@ -241,7 +287,7 @@ def montar_colunas_qualar(linha_parametros: str, n_colunas_df: int) -> list[str]
     # Alguns CSVs já trazem Data/Hora na linha de cabeçalho; outros trazem só parâmetros.
     partes_norm = [normalizar_texto(p) for p in partes]
     contem_data = any(p == "data" for p in partes_norm)
-    contem_hora = any(p == "hora" for p in partes_norm)
+    contem_hora = any(p == "hora" or p.startswith("hora ") for p in partes_norm)
 
     if contem_data and contem_hora:
         colunas = [classificar_coluna_qualar(p) for p in partes]
@@ -273,6 +319,12 @@ def limpar_hora(valor) -> str:
     except Exception:
         pass
 
+    # INMET: "0000 UTC", "1300 UTC" etc.
+    m_utc = re.match(r"^(\d{3,4})\s*(?:UTC)?$", s, flags=re.IGNORECASE)
+    if m_utc:
+        hhmm = m_utc.group(1).zfill(4)
+        return f"{hhmm[:2]}:{hhmm[2:]}"
+
     # 2400, 0000, 930 etc.
     if re.fullmatch(r"\d{3,4}", s):
         s = s.zfill(4)
@@ -300,7 +352,23 @@ def criar_datetime(df: pd.DataFrame) -> pd.DataFrame:
     mask_24 = hora_str.str.startswith("24:", na=False)
     hora_parse = hora_str.mask(mask_24, hora_str.str.replace(r"^24:", "00:", regex=True))
 
-    dt = pd.to_datetime(data_str + " " + hora_parse, format="%d/%m/%Y %H:%M", errors="coerce")
+    combinado = data_str + " " + hora_parse
+    dt = pd.to_datetime(combinado, format="%d/%m/%Y %H:%M", errors="coerce")
+
+    # INMET costuma vir como aaaa/mm/dd; QUALAR como dd/mm/aaaa.
+    # Não use apenas dayfirst=True: em datas aaaa/mm/dd ele interpreta errado dias <= 12.
+    for formato in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M", "%d/%m/%y %H:%M"):
+        faltantes = dt.isna()
+        if not faltantes.any():
+            break
+        dt_fmt = pd.to_datetime(combinado[faltantes], format=formato, errors="coerce")
+        dt.loc[faltantes] = dt_fmt
+
+    faltantes = dt.isna()
+    if faltantes.any():
+        dt_flex = pd.to_datetime(combinado[faltantes], errors="coerce")
+        dt.loc[faltantes] = dt_flex
+
     dt.loc[mask_24 & dt.notna()] = dt.loc[mask_24 & dt.notna()] + pd.Timedelta(days=1)
 
     df = df.copy()
@@ -451,7 +519,10 @@ def carregar_por_upload(arquivos_upload) -> tuple[pd.DataFrame, pd.DataFrame, li
 
 
 def carregar_por_pasta(pasta_entrada: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    caminhos = sorted(glob.glob(os.path.join(pasta_entrada, "*.csv")))
+    caminhos = sorted(set(
+        glob.glob(os.path.join(pasta_entrada, "*.csv")) +
+        glob.glob(os.path.join(pasta_entrada, "*.CSV"))
+    ))
     lidos: list[ArquivoLido] = []
     erros: list[str] = []
     estacoes: list[str] = []
@@ -729,7 +800,7 @@ with st.sidebar:
 
     if modo == "Upload no Streamlit":
         arquivos_upload = st.file_uploader(
-            "Envie os CSVs baixados do QUALAR",
+            "Envie os CSVs do QUALAR/CETESB ou INMET",
             type=["csv"],
             accept_multiple_files=True,
         )
@@ -759,8 +830,8 @@ with st.sidebar:
         height=80,
     )
 
-    processar = st.button("🚀 Gerar análise", type="primary", use_container_width=True)
-    limpar = st.button("🧹 Limpar dados carregados", use_container_width=True)
+    processar = st.button("🚀 Gerar análise", type="primary", width="stretch")
+    limpar = st.button("🧹 Limpar dados carregados", width="stretch")
 
 if limpar:
     st.session_state["qualar_df_original"] = pd.DataFrame()
@@ -773,7 +844,7 @@ if processar:
     try:
         if modo == "Upload no Streamlit":
             if not arquivos_upload:
-                st.error("Nenhum CSV foi enviado. Envie os arquivos do QUALAR antes de gerar.")
+                st.error("Nenhum CSV foi enviado. Envie os arquivos do QUALAR/CETESB ou INMET antes de gerar.")
                 st.stop()
             with st.spinner("Lendo e consolidando arquivos enviados..."):
                 df_carregado, log_carregado, estacoes_detectadas = carregar_por_upload(arquivos_upload)
@@ -810,7 +881,7 @@ if df_original.empty:
     st.info("Carregue os CSVs e clique em **Gerar análise**. Nada será exportado enquanto a base estiver vazia.")
     if not log.empty:
         st.markdown("### Log disponível")
-        st.dataframe(log, use_container_width=True)
+        st.dataframe(log, width="stretch")
     st.stop()
 
 # Filtro temporal aplicado depois do carregamento. Assim trocar ano não apaga a base.
@@ -871,14 +942,14 @@ aba1, aba2, aba3, aba4, aba5, aba6 = st.tabs([
 
 with aba1:
     st.markdown("### Log de leitura")
-    st.dataframe(log, use_container_width=True)
+    st.dataframe(log, width="stretch")
 
     st.markdown("### Prévia da base consolidada")
-    st.dataframe(df.head(500), use_container_width=True)
+    st.dataframe(df.head(500), width="stretch")
 
     st.markdown("### Completude por parâmetro")
     comp = diagnostico_completude(df, variaveis_num)
-    st.dataframe(comp.style.format({"% válido": "{:.1f}"}), use_container_width=True)
+    st.dataframe(comp.style.format({"% válido": "{:.1f}"}), width="stretch")
 
     st.markdown("### Visual nativo do Streamlit: registros válidos por parâmetro")
     st.bar_chart(comp.set_index("Parâmetro")[["% válido"]])
@@ -897,12 +968,12 @@ with aba2:
             "P75": "{:.2f}",
             "Máximo": "{:.2f}",
         }),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown("### Médias anuais")
     anual = tabela_media_anual(df, selecionados)
-    st.dataframe(anual.style.format({c: "{:.2f}" for c in selecionados}), use_container_width=True)
+    st.dataframe(anual.style.format({c: "{:.2f}" for c in selecionados}), width="stretch")
     if not anual.empty:
         st.line_chart(anual.set_index("Ano")[selecionados])
 
@@ -910,7 +981,7 @@ with aba2:
     tend = tabela_tendencias(df, selecionados)
     st.dataframe(
         tend.style.format({"inclinação por ano": "{:.4f}", "R²": "{:.3f}", "p-valor": "{:.3g}"}),
-        use_container_width=True,
+        width="stretch",
     )
     st.caption("Cinco anos é janela curta. Use como tendência descritiva, não como prova causal forte.")
 
@@ -1031,7 +1102,7 @@ with aba5:
             "rascunho gerado nesta aba",
         ],
     })
-    st.dataframe(checklist, use_container_width=True)
+    st.dataframe(checklist, width="stretch")
 
 with aba6:
     st.markdown("### Baixar planilha consolidada")
@@ -1040,7 +1111,7 @@ with aba6:
         data=excel_bytes(df, selecionados, log),
         file_name="Planilha_Geral_Unica_Tudo.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown("### Baixar gráficos em PNG 300 DPI")
@@ -1049,7 +1120,7 @@ with aba6:
         data=zip_graficos(df, selecionados),
         file_name="Graficos_QUALAR_300DPI.zip",
         mime="application/zip",
-        use_container_width=True,
+        width="stretch",
     )
 
     if modo == "Pasta local do computador":

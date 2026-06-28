@@ -1,7 +1,8 @@
-streamlit>=1.50
 pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+seaborn>=0.12
+scipy>=1.10
 openpyxl>=3.1
-matplotlib>=3.8
-seaborn>=0.13
-numpy>=1.26
-scipy>=1.11
+xlsxwriter>=3.1
+streamlit>=1.39

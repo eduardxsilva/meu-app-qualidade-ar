@@ -310,24 +310,31 @@ def criar_datetime(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["Datetime"])
 
 
+def converter_valor_numerico(valor):
+    """Converte número brasileiro sem destruir decimal em ponto.
+
+    Exemplos aceitos: 12,5 | 1.234,5 | 12.5 | - | vazio.
+    """
+    if pd.isna(valor):
+        return np.nan
+    s = str(valor).strip()
+    if s in {"", "-", "--", "nan", "NaN", "None"}:
+        return np.nan
+    s = s.replace(" ", "")
+    if "," in s:
+        # padrão brasileiro: ponto como milhar e vírgula como decimal
+        s = s.replace(".", "").replace(",", ".")
+    # se não tem vírgula, preserva ponto decimal
+    return pd.to_numeric(s, errors="coerce")
+
+
 def converter_numericos(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     ignorar = {"Data", "Hora", "Datetime"}
     for col in df.columns:
         if col in ignorar:
             continue
-        if df[col].dtype == object:
-            serie = (
-                df[col]
-                .astype(str)
-                .str.strip()
-                .str.replace(".", "", regex=False)       # remove milhar, se existir
-                .str.replace(",", ".", regex=False)      # decimal brasileiro
-                .replace({"": np.nan, "nan": np.nan, "None": np.nan, "-": np.nan})
-            )
-            df[col] = pd.to_numeric(serie, errors="coerce")
-        else:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = df[col].map(converter_valor_numerico)
     return df
 
 
@@ -422,7 +429,6 @@ def consolidar_dataframes(lista_lidos: list[ArquivoLido]) -> tuple[pd.DataFrame,
     return consolidado, pd.DataFrame(logs)
 
 
-@st.cache_data(show_spinner=False)
 def carregar_por_upload(arquivos_upload) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     lidos: list[ArquivoLido] = []
     erros: list[str] = []
@@ -444,7 +450,6 @@ def carregar_por_upload(arquivos_upload) -> tuple[pd.DataFrame, pd.DataFrame, li
     return df, log, sorted(set(estacoes))
 
 
-@st.cache_data(show_spinner=False)
 def carregar_por_pasta(pasta_entrada: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     caminhos = sorted(glob.glob(os.path.join(pasta_entrada, "*.csv")))
     lidos: list[ArquivoLido] = []
@@ -684,23 +689,42 @@ def zip_graficos(df: pd.DataFrame, variaveis: list[str], incluir_vento: bool = T
     return buffer_zip.getvalue()
 
 
+
+
+def salvar_zip_graficos_em_pasta(df: pd.DataFrame, variaveis: list[str], pasta_saida: str) -> str:
+    os.makedirs(pasta_saida, exist_ok=True)
+    caminho = os.path.join(pasta_saida, "Graficos_QUALAR_300DPI.zip")
+    with open(caminho, "wb") as f:
+        f.write(zip_graficos(df, variaveis))
+    return caminho
+
 # ============================================================
 # INTERFACE STREAMLIT
 # ============================================================
 
 st.title("🌫️ QUALAR — Consolidação e análise de qualidade do ar")
-st.caption("ACH1026 | 2021–2025 | Estatística descritiva, sazonalidade, tendência e meteorologia")
+st.caption("ACH1026 | 2021–2025 | Estatística descritiva, sazonalidade, tendência, vento e exportação")
+
+# Estado persistente: sem isso, o Streamlit zera os dados a cada clique/download.
+for chave, valor in {
+    "qualar_df_original": pd.DataFrame(),
+    "qualar_log": pd.DataFrame(),
+    "qualar_estacoes": [],
+    "qualar_ultimo_status": "",
+}.items():
+    if chave not in st.session_state:
+        st.session_state[chave] = valor
 
 with st.sidebar:
     st.header("1) Entrada dos dados")
     modo = st.radio(
         "Como carregar os CSVs?",
         ["Upload no Streamlit", "Pasta local do computador"],
-        help="Use pasta local se estiver rodando o app no seu próprio Windows. Em nuvem, use upload.",
+        help="No Streamlit Cloud, use upload. Pasta local só funciona rodando no seu Windows.",
     )
 
     arquivos_upload = []
-    pasta_entrada = ""
+    pasta_entrada = r"C:\Users\eduar\Downloads\qualar"
     pasta_saida = r"C:\Users\eduar\Downloads\consolidados"
 
     if modo == "Upload no Streamlit":
@@ -709,13 +733,14 @@ with st.sidebar:
             type=["csv"],
             accept_multiple_files=True,
         )
+        st.caption("Depois do upload, clique em **Gerar análise**.")
     else:
-        pasta_entrada = st.text_input("Pasta de entrada", value=r"C:\Users\eduar\Downloads\qualar")
-        pasta_saida = st.text_input("Pasta de saída", value=r"C:\Users\eduar\Downloads\consolidados")
+        pasta_entrada = st.text_input("Pasta de entrada", value=pasta_entrada)
+        pasta_saida = st.text_input("Pasta de saída", value=pasta_saida)
+        st.caption("O app precisa estar rodando no seu computador para acessar C:\\Users\\...")
 
-    st.header("2) Filtro do trabalho")
+    st.header("2) Recorte do trabalho")
     anos = st.multiselect("Anos analisados", options=list(range(2010, 2031)), default=ANOS_PADRAO)
-    st.info("O enunciado pede 2021–2025. Mude apenas se precisar conferir dados fora do recorte.")
 
     st.header("3) Estação")
     estacao_manual = st.text_input("Nome da estação", value="")
@@ -734,54 +759,84 @@ with st.sidebar:
         height=80,
     )
 
+    processar = st.button("🚀 Gerar análise", type="primary", use_container_width=True)
+    limpar = st.button("🧹 Limpar dados carregados", use_container_width=True)
 
-# Carregamento efetivo
-carregou = False
-log = pd.DataFrame()
-estacoes_detectadas: list[str] = []
+if limpar:
+    st.session_state["qualar_df_original"] = pd.DataFrame()
+    st.session_state["qualar_log"] = pd.DataFrame()
+    st.session_state["qualar_estacoes"] = []
+    st.session_state["qualar_ultimo_status"] = "Dados limpos."
+    st.rerun()
 
-if modo == "Upload no Streamlit" and arquivos_upload:
-    with st.spinner("Lendo e consolidando arquivos enviados..."):
-        df, log, estacoes_detectadas = carregar_por_upload(arquivos_upload)
-        carregou = not df.empty
-elif modo == "Pasta local do computador" and pasta_entrada:
-    if st.sidebar.button("Ler CSVs da pasta local", type="primary"):
-        with st.spinner("Lendo e consolidando arquivos da pasta local..."):
-            df, log, estacoes_detectadas = carregar_por_pasta(pasta_entrada)
-            carregou = not df.empty
-    else:
-        df = pd.DataFrame()
-else:
-    df = pd.DataFrame()
+if processar:
+    try:
+        if modo == "Upload no Streamlit":
+            if not arquivos_upload:
+                st.error("Nenhum CSV foi enviado. Envie os arquivos do QUALAR antes de gerar.")
+                st.stop()
+            with st.spinner("Lendo e consolidando arquivos enviados..."):
+                df_carregado, log_carregado, estacoes_detectadas = carregar_por_upload(arquivos_upload)
+        else:
+            if not os.path.isdir(pasta_entrada):
+                st.error(f"Pasta de entrada não encontrada: {pasta_entrada}")
+                st.stop()
+            arquivos_csv_local = glob.glob(os.path.join(pasta_entrada, "*.csv"))
+            if not arquivos_csv_local:
+                st.error(f"Nenhum .csv encontrado em: {pasta_entrada}")
+                st.stop()
+            with st.spinner("Lendo e consolidando arquivos da pasta local..."):
+                df_carregado, log_carregado, estacoes_detectadas = carregar_por_pasta(pasta_entrada)
 
-if not carregou:
-    st.info("Carregue os CSVs do QUALAR para iniciar a análise.")
+        if df_carregado.empty:
+            st.session_state["qualar_log"] = log_carregado
+            st.error("Os arquivos foram lidos, mas a base final ficou vazia. Veja o log de leitura abaixo.")
+        else:
+            st.session_state["qualar_df_original"] = df_carregado
+            st.session_state["qualar_log"] = log_carregado
+            st.session_state["qualar_estacoes"] = estacoes_detectadas
+            st.session_state["qualar_ultimo_status"] = f"Base carregada: {len(df_carregado):,} registros.".replace(",", ".")
+            st.success(st.session_state["qualar_ultimo_status"])
+    except Exception as e:
+        st.exception(e)
+        st.stop()
+
+# Usa a base persistida no session_state.
+df_original = st.session_state["qualar_df_original"].copy()
+log = st.session_state["qualar_log"].copy()
+estacoes_detectadas = list(st.session_state["qualar_estacoes"])
+
+if df_original.empty:
+    st.info("Carregue os CSVs e clique em **Gerar análise**. Nada será exportado enquanto a base estiver vazia.")
+    if not log.empty:
+        st.markdown("### Log disponível")
+        st.dataframe(log, use_container_width=True)
     st.stop()
 
-# Filtro temporal
+# Filtro temporal aplicado depois do carregamento. Assim trocar ano não apaga a base.
+df = df_original.copy()
 if anos:
     df = df[df["Ano"].isin(anos)].copy()
 
 if df.empty:
-    st.error("Após o filtro de anos, não sobrou dado. Confira se os arquivos são mesmo de 2021 a 2025.")
+    st.error("Após o filtro de anos, não sobrou dado. Confira se os CSVs são mesmo do período selecionado.")
     st.stop()
 
-# Identificação de variáveis disponíveis
+# Variáveis disponíveis
 variaveis_num = colunas_numericas(df)
 poluentes_disp = [c for c in POLUENTES_OBRIGATORIOS if c in variaveis_num]
 meteo_disp = [c for c in METEO_PADRAO if c in variaveis_num]
-outros_disp = [c for c in variaveis_num if c not in poluentes_disp + meteo_disp]
 
 estacao_detectada = ", ".join(estacoes_detectadas) if estacoes_detectadas else ""
 estacao_nome = estacao_manual.strip() or estacao_detectada or "Estação não identificada"
 
-# Seleção de parâmetros
-st.sidebar.header("5) Parâmetros")
-selecionados = st.sidebar.multiselect(
-    "Parâmetros para análise",
-    options=variaveis_num,
-    default=poluentes_disp[:5] if poluentes_disp else variaveis_num[:min(5, len(variaveis_num))],
-)
+with st.sidebar:
+    st.header("5) Parâmetros")
+    selecionados = st.multiselect(
+        "Parâmetros para análise",
+        options=variaveis_num,
+        default=poluentes_disp[:5] if poluentes_disp else variaveis_num[:min(5, len(variaveis_num))],
+    )
 
 if not selecionados:
     st.warning("Selecione ao menos um parâmetro numérico.")
@@ -797,15 +852,14 @@ col4.metric("Poluentes do enunciado encontrados", f"{len(poluentes_disp)}/5")
 
 if len(poluentes_disp) < 3:
     st.warning(
-        "O enunciado exige pelo menos 3 poluentes. Esta base, do jeito que foi lida, tem menos de 3 entre MP10, MP2.5, NOx, SO2 e O3. "
-        "Confira se a estação monitora esses parâmetros ou se faltam CSVs."
+        "O enunciado exige pelo menos 3 poluentes. Esta base tem menos de 3 entre MP10, MP2.5, NOx, SO2 e O3. "
+        "Pode ser limitação da estação, falta de CSV ou nome de coluna fora do padrão."
     )
 
 if lat != 0.0 and lon != 0.0:
     with st.expander("Mapa simples da estação"):
         st.map(pd.DataFrame({"lat": [lat], "lon": [lon], "estação": [estacao_nome]}), latitude="lat", longitude="lon", zoom=12)
 
-# Abas principais
 aba1, aba2, aba3, aba4, aba5, aba6 = st.tabs([
     "Base consolidada",
     "Estatística descritiva",
@@ -827,8 +881,7 @@ with aba1:
     st.dataframe(comp.style.format({"% válido": "{:.1f}"}), use_container_width=True)
 
     st.markdown("### Visual nativo do Streamlit: registros válidos por parâmetro")
-    comp_chart = comp.set_index("Parâmetro")[["% válido"]]
-    st.bar_chart(comp_chart)
+    st.bar_chart(comp.set_index("Parâmetro")[["% válido"]])
 
 with aba2:
     st.markdown("### Tabela obrigatória — estatística descritiva")
@@ -859,7 +912,7 @@ with aba2:
         tend.style.format({"inclinação por ano": "{:.4f}", "R²": "{:.3f}", "p-valor": "{:.3g}"}),
         use_container_width=True,
     )
-    st.caption("Use a tendência como apoio descritivo, não como prova causal. Cinco anos é uma janela curta.")
+    st.caption("Cinco anos é janela curta. Use como tendência descritiva, não como prova causal forte.")
 
 with aba3:
     param = st.selectbox("Parâmetro para gráficos", selecionados)
@@ -892,7 +945,7 @@ with aba4:
     if meteo_disp:
         st.write(", ".join(meteo_disp))
     else:
-        st.warning("Não foram encontrados parâmetros meteorológicos padronizados. Se a estação não mede meteorologia, use INMET/CGE e junte por Data/Hora.")
+        st.warning("Não foram encontrados parâmetros meteorológicos padronizados. Se a estação não mede meteorologia, junte INMET/CGE por Data/Hora.")
 
     if "Velocidade do vento (m/s)" in df.columns and "Direção do vento (°)" in df.columns:
         st.markdown("### Distribuição polar do vento")
@@ -917,14 +970,12 @@ with aba4:
         "- Temperatura e radiação tendem a ser relevantes para O3, pois o ozônio é secundário e fotoquímico.\n"
         "- Umidade, chuva e vento costumam alterar dispersão, deposição e ressuspensão de partículas.\n"
         "- Direção do vento deve ser cruzada com fontes no entorno: avenidas, corredores de ônibus, rodovias, indústrias e obras.\n"
-        "- Não force causalidade apenas por correlação. Use como evidência auxiliar no relatório."
+        "- Correlação não prova causalidade. Use como evidência auxiliar no relatório."
     )
 
 with aba5:
     st.markdown("### Rascunho técnico para orientar o relatório")
-    desc_sel = tabela_descritiva(df, selecionados)
     tend_sel = tabela_tendencias(df, selecionados)
-
     pior_completude = diagnostico_completude(df, selecionados).sort_values("% válido").head(1)
     pior_txt = ""
     if not pior_completude.empty:
@@ -943,7 +994,7 @@ with aba5:
 
 **Qualidade da base.** {pior_txt} A estatística descritiva deve ser interpretada considerando as falhas de medição, principalmente quando a completude for inferior a 70%.
 
-**Tendência.** {tendencia_txt} Como o período é curto, a tendência deve ser apresentada como descritiva/exploratória, não como conclusão causal forte.
+**Tendência.** {tendencia_txt} Como o período é curto, a tendência deve ser apresentada como descritiva/exploratória.
 
 **Fontes móveis no entorno.** {fontes_moveis}
 
@@ -989,6 +1040,7 @@ with aba6:
         data=excel_bytes(df, selecionados, log),
         file_name="Planilha_Geral_Unica_Tudo.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
     )
 
     st.markdown("### Baixar gráficos em PNG 300 DPI")
@@ -997,15 +1049,19 @@ with aba6:
         data=zip_graficos(df, selecionados),
         file_name="Graficos_QUALAR_300DPI.zip",
         mime="application/zip",
+        use_container_width=True,
     )
 
     if modo == "Pasta local do computador":
-        if st.button("Salvar Excel na pasta de saída local"):
+        st.markdown("### Salvar direto na pasta local")
+        if st.button("💾 Salvar Excel e gráficos na pasta de saída", type="primary"):
             try:
-                caminho = salvar_excel_em_pasta(df, selecionados, log, pasta_saida)
-                st.success(f"Arquivo salvo em: {caminho}")
+                caminho_excel = salvar_excel_em_pasta(df, selecionados, log, pasta_saida)
+                caminho_zip = salvar_zip_graficos_em_pasta(df, selecionados, pasta_saida)
+                st.success("Arquivos gerados com sucesso.")
+                st.code(f"{caminho_excel}\n{caminho_zip}")
             except Exception as e:
-                st.error(f"Falha ao salvar: {e}")
+                st.error(f"Falha ao salvar na pasta local: {e}")
 
-    st.markdown("### Código de uso")
-    st.code("pip install -r requirements.txt\nstreamlit run streamlit_app_qualar.py", language="bash")
+    st.markdown("### Como rodar")
+    st.code("pip install -r requirements_qualar.txt\nstreamlit run streamlit_app_qualar.py", language="bash")

@@ -6,3 +6,4 @@ scipy>=1.10
 openpyxl>=3.1
 xlsxwriter>=3.1
 streamlit>=1.39
+statsmodels
